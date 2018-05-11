@@ -40,6 +40,7 @@ class MetaLearner
 	int doCrossValidation(int);
 	int start(int);
 	int start_gradualMBIncrease(int);
+	int start_MCMC(int);
 	int start_gradualMBIncrease_RankRegulators(int);
 	int getTopRegs(map<int,int>&);
 	int setGlobalEvidenceManager(EvidenceManager*);
@@ -48,6 +49,9 @@ class MetaLearner
 	int setOutputDirName(const char*);
 	int setClusteringThreshold(double);
 	int setSpecificFold(int);
+	int setMCMCIterations(int);
+	int setBurnInIterations(int);
+	int setProposalSigma(double);
 	int showModelParameters(int);
 	int getPredictionError_Holdout(int);
 	int getPredictionError_CrossValid(int);
@@ -87,10 +91,17 @@ class MetaLearner
 
 	int collectMoves(int);
 	int collectMoves(int,int);
+	int compute_Move(int, int);
+	int compute_Hyperparameter(map<string,map<int,INTDBLMAP*>*>::iterator pItr, double beta);
+	int set_VarNeighborhoodPrior();
 	int sortMoves();
 	int makeMoves();
+	int makeRemoveMoves();
 	int attemptMove(MetaMove*,map<int,INTINTMAP*>&);
+	int attemptRemoveMove(MetaMove* move, map<int, INTINTMAP*>& affectedVars);
 	int getNewPLLScore(int cid, INTINTMAP& conditionSet, Variable* u, Variable* v, string& edgeKey, double& mbScore, double& scoreImprovement,Potential**);
+	double calculate_PLL(int cid, INTINTMAP& conditionSet, Variable* u, Variable* v, string& edgeKey, double& mbScore, double& scoreImprovement,Potential**, int& mType);
+	double calculate_PLL_Prior();
 	double getNewPLLScore_Condition(int cId, int csetId, int vId, Potential* newPot,int);
 	double getNewPLLScore_Condition(int csetId, int vId, Potential* newPot);
 	double getNewPLLScore_Condition(int csetId, int vId, int uID, Potential* newPot);
@@ -102,6 +113,7 @@ class MetaLearner
 
 	int cleanUp();
 	int dumpAllGraphs(int,int,int);
+	int dumpHyperparameters(int);
 	int getEdgeVars(string&, char*, char*);
 	bool checkMBSize(INTINTMAP*,int,int,int);
 	bool checkMBSize(int,int,int,int);
@@ -176,5 +188,9 @@ class MetaLearner
 	int currFold;
 	char foldoutDirName[1024];
 	int specificFold;
+	int mcmc_iters;
+	int burnin_iters;
+	double proposal_sigma;
+	double current_prior;
 };
 #endif

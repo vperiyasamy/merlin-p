@@ -22,11 +22,13 @@ class MetaMove
 	int setConditionSet(INTINTMAP&);
 	int setConditionSetInd(int);
 	int setDestPot(Potential*);
+	int setMoveType(int);
 
 	int getSrcVertex();
 	int getTargetVertex();
 	INTINTMAP& getConditionSet();
 	int getConditionSetInd();
+	int getMoveType();
 	double getScore();
 	double getSrcMBScore();
 	double getTargetMBScore();
@@ -39,6 +41,7 @@ class MetaMove
 	double targetMBScore;
 	int src;
 	int target;
+	int moveType; // 0 for edge removal, 1 for edge addition
 	INTINTMAP conditionSet;
 	int conditionSetInd;
 	Potential* destPot;

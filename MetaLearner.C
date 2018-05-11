@@ -27,6 +27,7 @@
 #include "HyperGeomPval.H"
 #include "Distance.H"
 #include "MetaLearner.H"
+#include "MemoryCheck.H"
 
 MetaLearner::MetaLearner()
 {
@@ -38,6 +39,7 @@ MetaLearner::MetaLearner()
 	lambda=0;
 	clusterThreshold=0.5;
 	specificFold=-1;
+	holdoutEvMgr = NULL;
 }
 
 MetaLearner::~MetaLearner()
@@ -262,6 +264,24 @@ int
 MetaLearner::setSpecificFold(int fid)
 {
 	specificFold=fid;
+	return 0;
+}
+
+int
+MetaLearner::setMCMCIterations(int iters) {
+	mcmc_iters = iters;
+	return 0;
+}
+
+int
+MetaLearner::setBurnInIterations(int iters) {
+	burnin_iters = iters;
+	return 0;
+}
+
+int
+MetaLearner::setProposalSigma(double sigma) {
+	proposal_sigma = sigma;
 	return 0;
 }
 
@@ -621,7 +641,11 @@ MetaLearner::doCrossValidation(int foldCnt)
 		}
 		clearFoldSpecData();
 		//start(f);
-		start_gradualMBIncrease(f);
+		if(mcmc_iters != -1) { // if mcmc flag was set, do mcmc
+			start_MCMC(f);
+		} else {
+			start_gradualMBIncrease(f);
+		}
 		//start_gradualMBIncrease_RankRegulators(f);
 		int totalEvid=0;
 		if(holdoutEvMgr!=NULL)
@@ -994,6 +1018,179 @@ MetaLearner::start_gradualMBIncrease_RankRegulators(int f)
 			moduleiter++;
 		}
 		cout <<"Final Score " << currGlobalScore << endl;
+		finalScores[f]=currGlobalScore;
+	}
+	return 0;
+}
+
+// vperiyasamy
+int
+MetaLearner::start_MCMC(int f) {
+
+	//Repeat until convergence
+	//int currK=1;
+	currFold = f;
+	sprintf(foldoutDirName, "%s/fold%d", outLocMap.begin()->second.c_str(), f);
+	int maxMBSizeApprox = maxFactorSizeApprox - 1; // what is this doing?
+	int currK = maxMBSizeApprox; // what is this doing?
+	int num_additions = 0;
+	int num_deletions = 0;
+
+	// setup gsl random number generator
+	rnd = gsl_rng_alloc(gsl_rng_default);
+	int rseed = getpid();
+	gsl_rng_set(rnd, rseed);
+	cout << rseed << endl;
+
+	// initialize edge prior and edge set with all false
+	initEdgePriorMeta_All();
+	initEdgeSet(false);
+	initPhysicalDegree();
+	int i = 0;
+
+	// populate v map (target genes?)
+	VSET& varSet = varManager->getVariableSet();
+	for(VSET_ITER vIter = varSet.begin(); vIter != varSet.end(); vIter++) {
+		idVidMap[i] = vIter->first;
+		i++;
+	}
+
+	if(strlen(trueGraphFName)==0) { // what is this check for?
+
+		double currGlobalScore = getInitPLLScore();
+		double initScore = getInitPrior();
+
+		int showid = 0;
+		int moduleiter = 0;
+		//vector<int> randOrder;
+
+		int iter = 0;
+		bool notConverged = true;
+
+		// moved these 3 lines outside of while loop
+		int attemptedMoves = 0;
+		double scorePremodule = currGlobalScore;
+		EvidenceManager* evMgr = evMgrSet.begin()->second;
+		cout << "starting MCMC iterations" << endl;
+		current_prior = calculate_PLL_Prior();
+
+		while(notConverged && iter < mcmc_iters) { // run MCMC 10,000 times
+			cout << "ITERATION " << iter << endl;
+			////////////////////////////////////////////////////////////////
+			// STRUCTURE SEARCH
+			////////////////////////////////////////////////////////////////
+			// TODO: instead of random target gene, do we pick a random modification and then a suitable pair? COMMENT: not right now
+			int rID = gsl_rng_uniform_int(rnd, varSet.size()); // pick any random target gene
+			if(idVidMap.find(rID) == idVidMap.end()) { // target gene might not be found?
+				cout <<"Variable at  " << rID << " just not found " << endl;
+				exit(0);
+			}
+
+			int vID = idVidMap[rID];
+			Variable* v = varSet[vID];	
+
+			compute_Move(currK, vID); // My version of collectMoves()
+			if(moveSet.size() == 0) {
+				cout << "edge move:\tNONE" << endl;
+				//iter++;
+				// if move wasn't accepted? Keep this
+				//continue;
+			} else {
+				sortMoves();
+				int moveReturn = 0;
+				if(moveSet[0]->getMoveType() == 1) { // adding edge
+					cout << "edge move:\tADD" << endl;
+					num_additions++;
+					moveReturn = makeMoves();
+				} else { // removing edge
+					cout << "edge move:\tREMOVE" << endl;
+					num_deletions++;
+					moveReturn = makeRemoveMoves();
+				}
+				// for hyperparameter, we must now update the graph prior with new edges
+				// NEW: update hyperparameter only every 1000 iterations
+				if(moveReturn != -1 && iter % 1000 == 0) {
+					Variable *u = varSet[moveSet[0]->getSrcVertex()];
+
+					double eprior = getEdgePrior(u->getID(),v->getID());
+					double moduleContrib = getModuleContribLogistic((string&)v->getName(), (string&)u->getName());//maybe aVar
+					double edgeProb = 1/(1 + exp(-1 * (eprior + moduleContrib)));
+					double edgeProbOld =1/(1 + exp(-1 * (eprior)));
+					double minus = log(1 - edgeProbOld);
+					double plus = log(edgeProb);
+					
+					if(moveSet[0]->getMoveType() == 1) {
+						//cout << "edge move:\tADD" << endl;
+						current_prior = current_prior + plus - minus;
+					} else {
+						//cout << "edge move:\tREMOVE" << endl;
+						current_prior = current_prior - plus + minus; // reverse what we are subtracting and adding if we just removed an edge
+					}
+					
+
+				}
+				//current_prior = calculate_PLL_Prior();
+			}
+			
+
+			////////////////////////////////////////////////////////////////
+			// HYPERPARAMETER SEARCH
+			////////////////////////////////////////////////////////////////
+			// NEW: update hyperparameter only every 1000 iterations
+			if(iter % 1000 == 0) {
+				for (map<string,map<int,INTDBLMAP*>*>::iterator pItr=edgepriormap.begin(); pItr!=edgepriormap.end(); pItr++) {
+					double gbeta = betamap[pItr->first];
+					double newBeta = gsl_ran_gaussian(rnd, proposal_sigma) + gbeta;
+					compute_Hyperparameter(pItr, newBeta);
+				}
+				dumpHyperparameters(iter);
+			}
+			
+
+			double newScore = getPLLScore();
+
+			double diff = newScore - currGlobalScore;
+/* Currently not exiting on threshold, just running all iterations
+			if(diff <= convThreshold) {
+				notConverged = false;
+			}
+*/
+			//dumpAllGraphs(currK,f,iter);
+			currGlobalScore = newScore;
+			//cout <<"Current iter " << iter << " Score after beta-theta " << newScore << endl;
+			for(map<int,INTINTMAP*>::iterator cIter = affectedVariables.begin(); cIter != affectedVariables.end(); cIter++)
+			{
+				cIter->second->clear();
+				delete cIter->second;
+			}
+
+			affectedVariables.clear();
+			showid++;
+			attemptedMoves++;
+/* Currently not defining modules and exiting on convergence threshold
+			if((currGlobalScore - scorePremodule) <= convThreshold)
+			{
+				notConverged = false;
+			}
+			else
+			{
+				redefineModules_Global();
+			}
+*/
+			iter++;
+			scorePremodule = currGlobalScore;
+			if(iter > burnin_iters && iter % 10000 == 0) { // output graph every ten thousand iterations after burn-in
+				dumpAllGraphs(currK, f, iter);
+				cout << "beta at iter " << iter  << ": " << betamap[edgepriormap.begin()->first] << endl; 
+			}
+			
+			cout << endl;			
+		}
+		
+		cout <<"\nFinal Score " << currGlobalScore << endl;
+		cout << "total number of edge addition moves: " << num_additions << endl;
+		cout << "total number of edge deletion moves: " << num_deletions << endl;
+		cout << "final beta: " << betamap[edgepriormap.begin()->first] << endl;
 		finalScores[f]=currGlobalScore;
 	}
 	return 0;
@@ -1950,6 +2147,290 @@ MetaLearner::collectMoves(int currK,int rind)
 	testedEdges.clear();
 	return 0;
 }
+
+// vperiyasamy
+int
+MetaLearner::compute_Move(int currK, int rind) {
+	double new_PLL = 0;
+
+	VSET& varSet = varManager->getVariableSet();
+	for(int i = 0; i < moveSet.size(); i++) {
+		delete moveSet[i];
+	}
+
+	moveSet.clear();
+	map<string,int> testedEdges;
+	int vID = idVidMap[rind];
+	int mType; // move type
+
+	// can get v straight from map instead of iterator
+	VSET_ITER vIter = varSet.find(vID);
+	if(vIter == varSet.end())
+		return 0;
+
+	Variable* v = vIter->second;
+	if(geneModuleID.find(v->getName()) == geneModuleID.end())
+		return 0;
+
+	int moduleID = geneModuleID[v->getName()];
+	map<string,int>* moduleMembers = moduleGeneSet[moduleID];
+	double bestTargetScore = 0;
+	double bestScoreImprovement = 0;
+	int bestCondSetInd = -1;
+	Variable* bestu = NULL;
+	map<string,INTDBLMAP*> impEdgeScoreImprovement;
+	map<int,double> bestConditionImprovement;
+	map<int,double> bestConditionScore;
+	map<int,double> bestCondSpecPLL;
+	Potential* bestPot = NULL;
+	bool bestUpdate = false;
+
+	// no longer iterating over regulators, instead choosing random one
+	//for(map<string,int>::iterator uIter = restrictedVarList.begin(); uIter != restrictedVarList.end(); uIter++) {
+
+	// TODO: at some point we need to make sure this random regulator is valid
+	map<string, int>::iterator uIter = restrictedVarList.begin();
+	int randReg = gsl_rng_uniform_int(rnd, restrictedVarList.size()); // pick any random regulator index in map
+	advance(uIter, randReg); // go that regulator
+
+	int regID = varManager->getVarID(uIter->first.c_str());
+
+	if(regID == -1)
+		return 0;
+	if(vIter->first == regID)
+		return 0;
+
+	// actually get regulator here
+	Variable* u = varSet[regID];
+
+	string edgeKey;
+	edgeKey.append(u->getName().c_str());
+	edgeKey.append("\t");
+	edgeKey.append(v->getName().c_str());
+
+	if(strcmp(edgeKey.c_str(),"YLR223C\tYHR108W") == 0 || strcmp(edgeKey.c_str(),"YMR182C\tYHR108W") == 0) {
+		cout <<"Stop here" << endl;
+	}
+	
+	testedEdges[edgeKey] = 0;
+
+	//Generate next condition assignments
+	if(edgeConditionMap.find(edgeKey) == edgeConditionMap.end()) {
+		cout <<"No edge " << edgeKey.c_str() << " u " << u->getID() << " v " << v->getID()<< endl;
+		exit(0);
+	}
+
+	INTINTMAP* conditionSet = edgeConditionMap[edgeKey];
+	map<int,double> conditionImprovement;
+	map<int,double> conditionScore;
+
+	for(INTINTMAP_ITER cIter = conditionSet->begin(); cIter != conditionSet->end(); cIter++) {
+		double scoreImprovement = 0;
+		double newTargetScore = 0;
+		Potential* aPot = NULL;
+		INTDBLMAP pll;
+		INTINTMAP* cset = getConditionSet(cIter->first);
+
+		// if(cIter->second == 1) {
+		// 	pll.clear();
+		// 	continue;
+		// }
+		// if(!checkMBSize(cIter->first,regID,vIter->first,currK)) {
+		// 	pll.clear();
+		// 	continue;
+		// }
+
+		// added by vperiyasamy, computed PLL and accepts on prob
+		new_PLL = calculate_PLL(cIter->first, *cset, u, v, edgeKey, newTargetScore, scoreImprovement, &aPot, mType);
+		double moduleWideScoreImprovement = getModuleWideScoreImprovement(cIter->first, *cset, u, v, moduleMembers);
+		conditionImprovement[cIter->first] = scoreImprovement;
+		conditionScore[cIter->first] = newTargetScore;
+		
+		// don't need if, ignore else block
+		// thus ensuring that we consider this move
+//		if((bestCondSetInd == -1) || (bestScoreImprovement < (scoreImprovement + moduleWideScoreImprovement)))
+		bestu = u;
+		bestTargetScore = newTargetScore;
+		bestScoreImprovement = scoreImprovement;
+		bestCondSetInd = cIter->first;
+		bestUpdate = true;
+		bestCondSpecPLL.clear();
+		for(INTDBLMAP_ITER dIter = pll.begin(); dIter != pll.end(); dIter++)
+		{
+			bestCondSpecPLL[dIter->first] = dIter->second;
+		}
+		if(bestPot != NULL)
+		{
+			delete bestPot;
+		}
+		bestPot = aPot;
+		if(strcmp(v->getName().c_str(),"YHR108W") == 0)
+		{
+			cout <<"Stop here" << endl;
+		}
+		
+		pll.clear();
+		
+	}
+
+	if(bestUpdate)
+	{
+		bestConditionImprovement.clear();
+		for(INTDBLMAP_ITER cvIter = conditionImprovement.begin(); cvIter != conditionImprovement.end(); cvIter++)
+		{
+			bestConditionImprovement[cvIter->first] = cvIter->second;
+			bestConditionScore[cvIter->first] = conditionScore[cvIter->first];
+		}
+	}
+	conditionImprovement.clear();
+	conditionScore.clear();
+	//bestUpdate = false;
+	
+	//At this stage we have the best condition set for the pair {u,bestv}.
+	// if((bestu == NULL) || (bestScoreImprovement <= 0))
+	// {
+	// 	testedEdges.clear();
+	// 	return 0;
+	// }
+
+	// now decide if we want to add move to moveset
+	// do this by computing acceptance probability
+	bool acceptGraph = false;
+	if(bestUpdate && mType != -1) { // make sure we're allowed to do move
+		if(new_PLL > 0) {
+			//cout << "accepting graph for sure" << endl;
+			// acc probability is greater than 1, so we accept for sure
+			acceptGraph = true;
+		} else {
+			// acc probability less than one, move back to prob domain
+			double acceptProb = exp(new_PLL);
+			if(gsl_rng_uniform(rnd) <= acceptProb) {
+				//cout << "choosing to accept graph" << endl;
+				acceptGraph = true;
+			}
+		}
+	}
+	//acceptGraph = false;
+	
+
+	if(acceptGraph) { // add move to move set
+		MetaMove* move = new MetaMove;
+		move->setSrcVertex(bestu->getID());
+		move->setConditionSetInd(bestCondSetInd);
+		for(INTDBLMAP_ITER dIter = bestCondSpecPLL.begin(); dIter != bestCondSpecPLL.end(); dIter++)
+		{
+			move->pll[dIter->first] = dIter->second;
+		}
+
+		// adding move to our best set
+		bestCondSpecPLL.clear();
+		bestConditionScore.clear();
+		move->setMoveType(mType); // vperiyasamy added type
+		move->setTargetVertex(v->getID());
+		move->setTargetMBScore(bestTargetScore);
+		move->setScoreImprovement(bestScoreImprovement);
+		move->setDestPot(bestPot);
+		moveSet.push_back(move);
+	}
+	else
+	{
+		delete bestPot;
+	}
+	
+	testedEdges.clear();
+	return 0;
+}
+
+// vperiyasamy
+int
+MetaLearner::compute_Hyperparameter(map<string,map<int,INTDBLMAP*>*>::iterator pItr, double beta) {
+
+	// save old beta
+	double oldBeta = betamap[pItr->first];
+	//cout << "old beta: " << oldBeta << endl;
+	//cout << "proposed beta: " << beta << endl;
+	// insert new beta
+	betamap[pItr->first] = beta;
+	// must go update varNeighborhoodPrior for empty graph prior calculation
+	set_VarNeighborhoodPrior();
+
+	// calculate updated prior
+	double newPLL_p = calculate_PLL_Prior();
+	double oldPLL_p = current_prior;
+	//cout << "old prior: " << current_prior << endl;
+	//cout << "new prior: " << newPLL_p << endl;
+	double impr = newPLL_p - oldPLL_p; // this is the log of acceptance probability A
+	//cout << "impr: " << impr << endl;
+	bool acceptBeta = false;
+	if(impr > 0) {
+		// acc probability is greater than 1, so we accept hyperparameter for sure
+		acceptBeta = true;
+	} else {
+		// acc probability less than one, move back to prob domain
+		double acceptProb = exp(impr);
+		//cout << "acceptance prob: " << acceptProb << endl;
+		if(gsl_rng_uniform(rnd) <= acceptProb) {
+			acceptBeta = true;
+		}
+	}
+
+	// if we didn't choose to accept beta, must go reset prior neighborhood
+	if(!acceptBeta) {
+		cout << "hyperparameter:\tNOT CHANGED" << endl;
+		betamap[pItr->first] = oldBeta; // reset beta to last iteration
+		current_prior = oldPLL_p; // save this prior so we don't recompute it next iteration
+
+		set_VarNeighborhoodPrior();
+	}
+	else { // if accepting beta, leave changes as is
+		cout <<  "hyperparameter:\tCHANGED" << endl;
+		// do nothing for now
+	}
+	return 0;
+}
+
+// vperiyasamy
+int
+MetaLearner::set_VarNeighborhoodPrior() {
+
+	varNeighborhoodPrior.clear();
+	VSET& varSet = varManager->getVariableSet();
+	for(VSET_ITER uIter = varSet.begin(); uIter != varSet.end(); uIter++) {
+		Variable* u = varSet[uIter->first];
+		if((restrictedVarList.size() > 0) && (restrictedVarList.find(u->getName()) == restrictedVarList.end())) {
+			continue;
+		}
+
+		for(VSET_ITER vIter = varSet.begin(); vIter != varSet.end(); vIter++) {
+			if(uIter->first == vIter->first) {
+				continue;
+			}
+			Variable* v = varSet[vIter->first];
+			if(geneModuleID.find(v->getName()) == geneModuleID.end()) {	
+				continue;
+			}
+
+			double initPrior = getEdgePrior(uIter->first,vIter->first);
+			initPrior = 1 / (1 + exp(-1 * initPrior));
+			
+			if(initPrior < 1e-6) {
+				initPrior = 1e-6;
+			}
+			else if(initPrior == 1) {
+				initPrior = 1 - 1e-6;
+			}
+
+			if(varNeighborhoodPrior.find(vIter->first) == varNeighborhoodPrior.end()) {
+				varNeighborhoodPrior[vIter->first] = log(1 - initPrior);
+			}
+			else {
+				varNeighborhoodPrior[vIter->first] = varNeighborhoodPrior[vIter->first] + log(1 - initPrior);
+			}
+		}
+	}
+	return 0;
+}
+
 double
 MetaLearner::getModuleWideScoreImprovement(int cid,INTINTMAP& conditionSet,Variable* u, Variable* v,map<string,int>* moduleMembers)
 {
@@ -1995,6 +2476,227 @@ MetaLearner::getModuleWideScoreImprovement(int cid,INTINTMAP& conditionSet,Varia
 	return score;
 }
 
+// vperiyasamy
+double
+MetaLearner::calculate_PLL(int cid, INTINTMAP& conditionSet, Variable* u, Variable* v, string& edgeKey, double& mbScore, double& scoreImprovement, Potential** newdPot, int& mType) {
+	VSET& varSet = varManager->getVariableSet();
+	map<int,Potential*> dPots;
+	map<int,bool> dPotDels;
+	scoreImprovement = 0;
+	bool delFromD = true;
+	bool addingEdge = false;
+	double currPrior = varNeighborhoodPrior[v->getID()];
+	double plus = 0;
+	double minus = 0;
+	double retPLL = 0.0;
+
+	for(INTINTMAP_ITER cIter = conditionSet.begin(); cIter != conditionSet.end(); cIter++) {
+		PotentialManager* potMgr = potMgrSet[cIter->first];
+		FactorGraph* fg = fgGraphSet[cIter->first];
+		SlimFactor* dFactor = fg->getFactorAt(v->getID());
+
+		//Pretend as if we were already adding dFactor into sFactor's MB
+		if(cIter->second == 1) {
+			INTINTMAP_ITER dIter = dFactor->mergedMB.find(u->getID());
+			if(dIter == dFactor->mergedMB.end()) {
+				//delFromD = false;
+				addingEdge = true;
+				mType = 1; // setting move type
+				dFactor->mergedMB[u->getID()] = 0; // setting edge as added into this graph
+			}
+			else {
+				if(dFactor->mergedMB.size() == 1) {
+					mType = -1;
+					return 0;
+				}
+				mType = 0; // setting move type
+				dFactor->mergedMB.erase(dIter); // clearing edge from graph
+			}
+			dPotDels[cIter->first] = delFromD;
+		}
+
+		Potential *dPot = new Potential;
+		dPot->setAssocVariable(varSet[dFactor->fId],Potential::FACTOR);
+
+		for(INTINTMAP_ITER mIter = dFactor->mergedMB.begin(); mIter != dFactor->mergedMB.end(); mIter++) {
+			Variable* aVar = varSet[mIter->first];
+			dPot->setAssocVariable(aVar,Potential::MARKOV_BNKT);
+			double eprior = getEdgePrior(mIter->first,v->getID());
+			double moduleContrib = getModuleContribLogistic((string&)v->getName(), (string&)u->getName());//maybe aVar
+			double edgeProb = 1/(1 + exp(-1 * (eprior + moduleContrib)));
+			double edgeProbOld =1/(1 + exp(-1 * (eprior)));
+			minus = minus + log(1 - edgeProbOld);
+			plus = plus + log(edgeProb);
+		}
+
+		dPots[cIter->first] = dPot;
+		dPot->potZeroInit();
+		dPot->setCondBias(dFactor->potFunc->getCondBias());
+		dPot->setCondVariance(dFactor->potFunc->getCondVariance());
+		dPot->setCondWeight(dFactor->potFunc->getCondWeight());
+	}
+
+	currPrior = currPrior + plus - minus;
+	string condKey;
+	genCondSetKey(conditionSet, condKey);
+	PotentialManager* potMgr = potMgrSet[cid];
+	double newPLL_d = 0;
+	*newdPot = dPots[cid];
+	potMgr->populatePotential(*newdPot, random);
+	(*newdPot)->initMBCovMean(); // TODO: do we need to do this?
+	for(map<int,Potential*>::iterator pIter = dPots.begin(); pIter != dPots.end(); pIter++) {
+		Potential* dPot = pIter->second;
+		if((dPot->getCondVariance() < 0) || (isnan(dPot->getCondVariance())) || (isinf(dPot->getCondVariance()))) {
+			scoreImprovement = -1;
+		}
+	}
+	if(scoreImprovement != -1) {
+		newPLL_d = getNewPLLScore_Condition_Tracetrick(cid, v->getID(), u->getID(), *newdPot);
+		newPLL_d = newPLL_d + currPrior;
+		int keyid = evMgrSet.begin()->first;
+		INTDBLMAP* plls = currPLLMap[keyid];
+		double oldPLL_d = (*plls)[v->getID()]; // stored old PLL_d
+		double dImpr = newPLL_d - oldPLL_d; // this is the log of acceptance probability A
+
+		if(edgePresenceProb.find(edgeKey) == edgePresenceProb.end()) {
+			cout <<"No edge prior for " << edgeKey.c_str() << endl;
+			exit(0);
+		}
+		
+		// if(dImpr <= 0) {
+		// 	scoreImprovement = -1;
+		// }
+
+		// else {
+		// removed if/else around dImpr being positive
+		if(!delFromD) {	
+			cout <<"Trying to add the same regulator " << u->getName() <<" to " << v->getName() << endl;
+		}
+
+		scoreImprovement = dImpr;
+		mbScore = newPLL_d;
+
+		for(map<int,Potential*>::iterator sIter = dPots.begin(); sIter != dPots.end(); sIter++) {
+			if(sIter->first == cid) {
+				continue;
+			}
+			delete sIter->second;
+		}
+		dPots.clear();
+		// }
+		retPLL = dImpr;
+	}
+
+	// delete the edge that we've temporarily added OR add edge that we've temporarily deleted
+	for(map<int,bool>::iterator bIter = dPotDels.begin(); bIter != dPotDels.end(); bIter++) {
+		if(bIter->second == false) {
+			continue;
+		}
+		bool delFromD = bIter->first;
+		FactorGraph* fg = fgGraphSet[bIter->first];
+		SlimFactor* dFactor = fg->getFactorAt(v->getID());
+		INTINTMAP_ITER dIter = dFactor->mergedMB.find(u->getID());
+		if(addingEdge) {
+			dFactor->mergedMB.erase(dIter);
+		} else {
+			dFactor->mergedMB[u->getID()] = 0;
+		}
+	}
+
+	// 4/11/2018 just uncommented this if statement
+	//if(scoreImprovement < 0) {
+	//	for(map<int,Potential*>::iterator pIter = dPots.begin(); pIter != dPots.end(); pIter++) {
+	//		delete pIter->second;
+	//	}
+	//	dPots.clear();
+	//	*newdPot = NULL;
+	//}
+
+	return retPLL;
+
+}
+
+// vperiyasamy
+double
+MetaLearner::calculate_PLL_Prior() {
+	VSET& varSet = varManager->getVariableSet();
+	// map<int,Potential*> dPots;
+	// map<int,bool> dPotDels;
+	
+	double total_prior = 0;
+
+	// want to iterate over all target genes and sum up total prior
+	for(VSET_ITER vIter = varSet.begin(); vIter != varSet.end(); vIter++) {
+
+		Variable *v = varSet[vIter->first];
+
+		double currPrior = varNeighborhoodPrior[v->getID()];
+		double plus = 0;
+		double minus = 0;
+		// --------------------> TODO: is it okay to comment all of these out? and move two of them down there
+		//PotentialManager* potMgr = potMgrSet[cIter->first];
+		//FactorGraph* fg = fgGraphSet[cIter->first];
+		//SlimFactor* dFactor = fg->getFactorAt(v->getID());
+
+		//Potential *dPot = new Potential;
+		//dPot->setAssocVariable(varSet[dFactor->fId],Potential::FACTOR);
+
+		// iterate over all regulators for edges to this target gene
+		// QUESTION: do we use restrictedVarList here or varSet?
+		//for(map<string, int>::iterator uIter = restrictedVarList.begin(); uIter != restrictedVarList.end(); uIter++) {
+		////	int regID = varManager->getVarID(uIter->first.c_str());
+		////	if(regID==-1) {
+		////		continue;
+		////	}
+		////
+		////	if(vIter->first==regID) {
+		////		continue;
+		////	}
+
+		////	Variable* u = varSet[regID];
+
+		////	string edgeKey;
+		////	edgeKey.append(u->getName().c_str());
+		////	edgeKey.append("\t");
+		////	edgeKey.append(v->getName().c_str());
+
+		////	INTINTMAP* conditionSet = edgeConditionMap[edgeKey];
+
+		////	for(INTINTMAP_ITER cIter = conditionSet->begin(); cIter != conditionSet->end(); cIter++) {	
+
+				// do we need this???
+		FactorGraph* fg = fgGraphSet.begin()->second;//[cIter->first];
+		SlimFactor* dFactor = fg->getFactorAt(v->getID());
+		// Potential *dPot = new Potential; // this and line  below seem to be unimportant
+		// dPot->setAssocVariable(varSet[dFactor->fId],Potential::FACTOR);
+
+		for(INTINTMAP_ITER mIter = dFactor->mergedMB.begin(); mIter != dFactor->mergedMB.end(); mIter++) {
+			Variable* aVar = varSet[mIter->first];
+			////dPot->setAssocVariable(aVar,Potential::MARKOV_BNKT);
+			double eprior = getEdgePrior(mIter->first,v->getID());
+			double moduleContrib = getModuleContribLogistic((string&)v->getName(), (string&)aVar->getName());//maybe aVar
+			double edgeProb = 1/(1 + exp(-1 * (eprior + moduleContrib)));
+			double edgeProbOld =1/(1 + exp(-1 * (eprior)));
+			minus = minus + log(1 - edgeProbOld);
+			plus = plus + log(edgeProb);
+		}
+				// do we need these???
+				// dPots[cIter->first] = dPot;
+				// dPot->potZeroInit();
+				// dPot->setCondBias(dFactor->potFunc->getCondBias());
+				// dPot->setCondVariance(dFactor->potFunc->getCondVariance());
+		////	}
+
+
+			// update current prior with this u->v edge's contribution
+		currPrior = currPrior + plus - minus;
+		////}
+		// update entire graphs prior with all of this target gene's edge priors
+		total_prior += currPrior;		
+
+	}
+	return total_prior; // <--- does this now have the correct total prior?
+}
 
 int
 MetaLearner::getNewPLLScore(int cid, INTINTMAP& conditionSet, Variable* u, Variable* v, string& edgeKey, double& mbScore, double& scoreImprovement, Potential** newdPot)
@@ -2277,6 +2979,7 @@ MetaLearner::getNewPLLScore_Condition_Tracetrick(int csetId, int vId, int uId, P
 	double paramPrior=0;
 	Potential* parentPot=new Potential;
 	VSET& vars=newPot->getAssocVariables();
+	
 	for(VSET_ITER vIter=vars.begin();vIter!=vars.end();vIter++)
 	{
 		if(vIter->first==vId)
@@ -2286,10 +2989,11 @@ MetaLearner::getNewPLLScore_Condition_Tracetrick(int csetId, int vId, int uId, P
 		Variable* aVar=vars[vIter->first];
 		parentPot->setAssocVariable(aVar,Potential::MARKOV_BNKT);
 	}
+	//cout << "#size of varset: " << vars.size() << endl;
 	parentPot->potZeroInit();
 	PotentialManager* potMgr=potMgrSet.begin()->second;
 	potMgr->populatePotential(parentPot,false);
-	//parentPot->initMBCovMean();
+	//parentPot->initMBCovMean(); // uncommented
 	EvidenceManager* evMgr=evMgrSet.begin()->second;
 	INTINTMAP* tSet=&evMgr->getTrainingSet();
 	int datasize=tSet->size();
@@ -2299,7 +3003,9 @@ MetaLearner::getNewPLLScore_Condition_Tracetrick(int csetId, int vId, int uId, P
 	double paramCnt=paramCnt+(2*vCnt)+((vCnt*(vCnt-1))/2);
 	pll=jointll1-jointll2;
 	pll=pll-(lambda*paramCnt*log(datasize));
+	
 	delete parentPot;
+	
 	return pll;
 }
 
@@ -2371,6 +3077,7 @@ MetaLearner::sortMoves()
 int
 MetaLearner::makeMoves()
 {
+	int retval = 0;
 	//map<int,INTINTMAP*> affectedVariables;
 	for(map<int,FactorGraph*>::iterator gIter=fgGraphSet.begin();gIter!=fgGraphSet.end();gIter++)
 	{
@@ -2385,6 +3092,7 @@ MetaLearner::makeMoves()
 		MetaMove* move=moveSet[m];
 		int pool=0;
 		INTINTMAP* cSet=getConditionSet(move->getConditionSetInd());
+
 		if(attemptMove(move,affectedVariables)==0)
 		{
 			successMove++;
@@ -2392,12 +3100,46 @@ MetaLearner::makeMoves()
 		}
 		else
 		{
+			retval = -1;
 			Potential* apot=move->getDestPot();
 			delete apot;
 		}
 	}
 	//cout <<"Total successful moves " << successMove << " out of total " << moveSet.size() << " with net score improvement " << netScoreDelta<< endl;
-	return 0;
+	return retval;
+}
+
+int
+MetaLearner::makeRemoveMoves()
+{
+	int retval = 0;
+	//map<int,INTINTMAP*> affectedVariables;
+	for(map<int,FactorGraph*>::iterator gIter = fgGraphSet.begin(); gIter != fgGraphSet.end(); gIter++)
+	{
+		int cind = gIter->first;
+		INTINTMAP* csVars = new INTINTMAP;
+		affectedVariables[cind] = csVars;
+	}
+	int successMove = 0;
+	double netScoreDelta = 0;
+	for(int m = 0; m < moveSet.size(); m++)
+	{
+		MetaMove* move = moveSet[m];
+		int pool = 0;
+		INTINTMAP* cSet = getConditionSet(move->getConditionSetInd());
+		if(attemptRemoveMove(move, affectedVariables) == 0)
+		{
+			successMove++;
+			netScoreDelta = netScoreDelta + move->getScoreImprovement();
+		}
+		else
+		{
+			retval = -1;
+			Potential* apot = move->getDestPot();
+			delete apot;
+		}
+	}
+	return retval;
 }
 
 int
@@ -2410,6 +3152,7 @@ MetaLearner::attemptMove(MetaMove* move,map<int,INTINTMAP*>& affectedVars)
 	edgeKey.append(u->getName().c_str());
 	edgeKey.append("\t");
 	edgeKey.append(v->getName().c_str());
+	//cout << "adding edge: " << edgeKey << endl;
 	
 	if(strcmp(u->getName().c_str(),"G114")==0 || strcmp(v->getName().c_str(),"G124")==0)
 	{
@@ -2448,6 +3191,7 @@ MetaLearner::attemptMove(MetaMove* move,map<int,INTINTMAP*>& affectedVars)
 		{
 			cout <<"Stop !! Trying to add the same edge " <<edgeKey << "   "<< v->getName() << endl;
 		}
+
 		dFactor->mergedMB[move->getSrcVertex()]=0;
 		dFactor->mbScore=move->getTargetMBScore();
 		(*conditionSet)[cIter->first]=1;
@@ -2502,6 +3246,127 @@ MetaLearner::attemptMove(MetaMove* move,map<int,INTINTMAP*>& affectedVars)
 	return 0;
 }
 
+int
+MetaLearner::attemptRemoveMove(MetaMove* move, map<int, INTINTMAP*>& affectedVars)
+{
+	VSET& varSet = varManager->getVariableSet();
+	string edgeKey;
+	Variable* u = varSet[move->getSrcVertex()];
+	Variable* v = varSet[move->getTargetVertex()];
+	edgeKey.append(u->getName().c_str());
+	edgeKey.append("\t");
+	edgeKey.append(v->getName().c_str());
+	//cout << "removing edge: " << edgeKey << endl;
+	string tgtName = v->getName();
+	string tfName = u->getName();
+	
+	if(edgeConditionMap.find(edgeKey) == edgeConditionMap.end())
+	{
+		//cout << "### didnt remove, edgeConditionMap!" << endl;
+		//cout <<"Edge " << edgeKey << " not found " << endl;
+		return -1;
+	}
+	INTINTMAP* conditionSet = edgeConditionMap[edgeKey];
+	int csetind = move->getConditionSetInd();
+	if(affectedVars.find(1) == affectedVars.end())
+	{
+		cout << "No csvars for condition " << csetind << endl;
+		exit(0);
+	}
+	INTINTMAP* csVars = affectedVars[1];
+	if((csVars->find(move->getSrcVertex()) != csVars->end()) || (csVars->find(move->getTargetVertex()) != csVars->end()))
+	{
+		//cout << "### didnt remove, affectedVars!" << endl;
+		return -1;
+	}
+	//removedEdges[edgeKey] = 0; // for debugging purposes AKA not needed
+	//(*csVars)[move->getSrcVertex()]=0;
+	(*csVars)[move->getTargetVertex()] = 0;
+	INTINTMAP* condset = condsetMap[csetind];
+	for(INTINTMAP_ITER cIter = condset->begin(); cIter != condset->end(); cIter++)
+	{
+		if(cIter->second == 0)
+		{
+			continue;
+		}
+		//cout << "### Attempted remove!" << endl;
+		FactorGraph* csGraph = fgGraphSet[cIter->first];
+		SlimFactor* dFactor = csGraph->getFactorAt(move->getTargetVertex());
+		INTINTMAP_ITER dItr = dFactor->mergedMB.find(move->getSrcVertex());
+		if(dItr != dFactor->mergedMB.end())
+		{
+			//cout << "### Succeeded in remove!" << endl;
+			//cout << "### size before rm: " << dFactor->mergedMB.size() << "," << edgeKey << endl;
+			dFactor->mergedMB.erase(dItr);
+			//cout << "### size after rm: " << dFactor->mergedMB.size() << "," << edgeKey << endl;
+			//cout << "### pot size before rm: " << regWts.size() << "," << edgeKey << endl;
+			dFactor->mbScore = move->getTargetMBScore();
+			(*conditionSet)[cIter->first] = 1;
+			delete dFactor->potFunc;
+			dFactor->potFunc = move->getDestPot();
+			dFactor->updatePartialMeans(dFactor->potFunc->getAllPartialMeans());
+			INTDBLMAP* plls = currPLLMap.begin()->second;
+			(*plls)[dFactor->fId] = dFactor->mbScore;
+			//cout << "### pot size after rm: " << regWts.size() << "," << edgeKey << endl;
+			//if (tgtName == "YKL096W" || tgtName == "YGR249W" || tgtName == "YJL196C")
+			//if (tgtName == "YKL096W")
+			//{
+			//	INTDBLMAP& regWts=dFactor->potFunc->getCondWeight();
+			//	cout << "###\tRemoving " << tfName << " from " << tgtName << endl;
+			//	cout << "###\tDeltaImprovement: " << move->getScoreImprovement() << endl;
+			//	cout << "###\tCurrent edges:" << endl;
+			//	for(INTDBLMAP_ITER mIter=regWts.begin();mIter!=regWts.end();mIter++)
+			//	{
+			//		string tname = varSet[mIter->first]->getName();
+			//		double v = mIter->second;
+			//		cout << "###\t" << tname << "\t" << tgtName << "\t" << v << endl;
+			//	}
+			//}
+		}
+	}
+	//Get the module and update its indegree
+	int mID = geneModuleID[v->getName()];
+	map<string,int>* currIndegree = NULL;
+	if(moduleIndegree.find(mID) == moduleIndegree.end())
+	{
+		currIndegree = new map<string,int>;
+		moduleIndegree[mID] = currIndegree;
+	}
+	else
+	{
+		currIndegree = moduleIndegree[mID];
+	}
+	if(currIndegree->find(u->getName()) == currIndegree->end())
+	{
+		//Shouldnt happen, because we are removing an existing edge!
+	}
+	else
+	{	
+		//cout <<"Updating regulator " << u->getName() <<" to module " << mID << endl;
+		(*currIndegree)[u->getName()] = (*currIndegree)[u->getName()] - 1;
+	}
+	if(regulatorModuleOutdegree.find(u->getName()) == regulatorModuleOutdegree.end())
+	{
+		//Shouldnt happen, because we are removing an existing edge!
+	}
+	else
+	{
+		regulatorModuleOutdegree[u->getName()] = regulatorModuleOutdegree[u->getName()] - 1;
+	}
+	//cout << "Made move for " << edgeKey.c_str() << " in condition " << csetind << endl;
+	//edgeRemoveUpdates[edgeKey] = 1; // not used anymore because it was used for getPriorChange() function which is now unused
+	(*conditionSet)[csetind] = 1;
+	int curriter = 0;
+	if(variableStatus.find(v->getName()) == variableStatus.end())
+	{
+		variableStatus[v->getName()] = curriter;
+	}
+	else
+	{
+		variableStatus[v->getName()] = variableStatus[v->getName()] + 1;
+	}
+	return 0;
+}
 
 int
 MetaLearner::dumpAllGraphs(int currK,int foldid,int iter)
@@ -2513,7 +3378,8 @@ MetaLearner::dumpAllGraphs(int currK,int foldid,int iter)
 	{
 		string& dirname=outLocMap[eIter->first];
 		//sprintf(aFName,"%s/var_mb_pw_k%d.txt",foldoutDirName,currK,iter);
-		sprintf(aFName,"%s/prediction_k%d.txt",foldoutDirName,currK+1);
+		//sprintf(aFName,"%s/prediction_k%d.txt",foldoutDirName,currK+1);
+		sprintf(aFName,"%s/prediction_k%d_i%d.txt",foldoutDirName,currK+1,iter);
 		ofstream oFile(aFName);
 		//sprintf(aFName,"%s/bias.txt",foldoutDirName,currK);
 		//ofstream bFile(aFName);
@@ -2546,6 +3412,21 @@ MetaLearner::dumpAllGraphs(int currK,int foldid,int iter)
 			oFile.close();
 		}
 	}
+	return 0;
+}
+
+int
+MetaLearner::dumpHyperparameters(int iter)
+{
+	char aFName[1024];
+	sprintf(aFName, "%s/hyperparameter.txt",foldoutDirName);
+	ofstream oFile(aFName, std::ios::app);
+	for (map<string,map<int,INTDBLMAP*>*>::iterator pItr=edgepriormap.begin(); pItr!=edgepriormap.end(); pItr++) {
+		double gbeta = betamap[pItr->first];
+		oFile <<  iter << "\t" << gbeta << endl;
+	}
+	oFile.close();
+	
 	return 0;
 }
 

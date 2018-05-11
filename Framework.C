@@ -61,13 +61,16 @@ Framework::init(int argc, char** argv)
 	bool rDefault = true;
 	bool oDefault = true;
 	bool wDefault = true;
+	bool mDefault = true;
+	bool sDefault = true;
+	bool bDefault = true;
 	bool clusterDefault=true;
 	bool regDefault=true;
 	int optret='-';
 	opterr=1;
 	int oldoptind=optind;
  
-	while(optret=getopt(argc,argv,"o:k:d:v:l:p:r:c:h:f:q:")!=-1)
+	while(optret=getopt(argc,argv,"o:k:d:v:l:p:r:c:h:f:q:m:s:b:")!=-1)
 	{
 		if(optret=='?')
 		{
@@ -199,6 +202,24 @@ Framework::init(int argc, char** argv)
 				metaLearner.setSpecificFold(atoi(optarg));
 				break;
 			}
+			case 'm':
+			{
+				mDefault = false;
+				metaLearner.setMCMCIterations(atoi(optarg));
+				break;
+			}
+			case 's': 
+			{
+				sDefault = false;
+				metaLearner.setProposalSigma(atof(optarg));
+				break;
+			}
+			case 'b':
+			{
+				bDefault = false;
+				metaLearner.setBurnInIterations(atoi(optarg));
+				break;
+			}
 			case '?':
 			{
 				/* getopt_long already printed an error message. */
@@ -257,6 +278,18 @@ Framework::init(int argc, char** argv)
 	{
 		metaLearner.setBeta_Motif(4);
 	}
+	if(mDefault)
+	{
+		metaLearner.setMCMCIterations(-1);
+	}
+	if(sDefault)
+	{
+		metaLearner.setProposalSigma(0.1);
+	}
+	if(bDefault)
+	{
+		metaLearner.setBurnInIterations(5000);
+	}
 
 	metaLearner.initPartitions(condCnt);
 	return Error::SUCCESS;
@@ -287,7 +320,9 @@ main(int argc, char* argv[])
 			<< "-o outputdirectory" << endl
 			<< "-c clusterassignment (default random_partitioning) "<< endl
 			<< "-h hierarchical_clustering_threshold (default 0.6)"<< endl
-			<< "-f specificfold_torun (default is -1)" << endl ;
+			<< "-f specificfold_torun (default is -1)" << endl
+			<< "-m mcmc_iterations (default is 10,000)" << endl
+			<< "-s proposal_sigma_proportion (default is 0.01" << endl;
 		return 0;
 	}
 	Framework fw;

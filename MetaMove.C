@@ -76,6 +76,11 @@ MetaMove::setDestPot(Potential* apot)
 	return 0;
 }
 
+int
+MetaMove::setMoveType(int type) {
+	moveType = type;
+	return 0;
+}
 
 int 
 MetaMove::getSrcVertex()
@@ -99,6 +104,12 @@ int
 MetaMove::getConditionSetInd()
 {	
 	return conditionSetInd;
+}
+
+int
+MetaMove::getMoveType()
+{
+	return moveType;
 }
 
 double 
